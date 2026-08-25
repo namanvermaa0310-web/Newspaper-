@@ -1,0 +1,11 @@
+set fp [open "power_supply_currents.csv" w]
+set rpt [get_report power_supply_currents]
+puts rpt headers] ","]
+foreach row [dict get latex
+rpt rows] { puts 
+
+fp [join latex
+row ","] } close 
+
+fp
+puts "Saved report to power_supply_currents.csv"
