@@ -152,6 +152,7 @@ module ftile_eth_400g_model #(
     reg        rx_active;
 
     integer s, b;
+    integer frames_this_beat;   // blocking accumulator - see note below
     reg [15:0] nlen;
     reg [DATA_W-1:0]          nx_data;
     reg [NUM_SEG-1:0]         nx_inframe;
@@ -175,6 +176,7 @@ module ftile_eth_400g_model #(
             o_model_rx_frames    <= 0;
         end else if (i_gen_enable || rx_active) begin
 
+            frames_this_beat = 0;
             nx_data    = 0;
             nx_inframe = 0;
             nx_empty   = 0;
@@ -211,8 +213,8 @@ module ftile_eth_400g_model #(
                             nx_fcs[s]            = 1'b1;
                             nx_err[s*2 +: 2]     = 2'd1;   // malformed
                         end
-                        rx_seq            = rx_seq + 1'b1;
-                        o_model_rx_frames <= o_model_rx_frames + 1'b1;
+                        rx_seq           = rx_seq + 1'b1;
+                        frames_this_beat = frames_this_beat + 1;
                         rx_active          = 1'b0;   // next segment may start
                         rx_off             = 0;      // a NEW frame immediately
                     end else begin
@@ -228,6 +230,7 @@ module ftile_eth_400g_model #(
             o_rx_mac_error       <= nx_err;
             o_rx_mac_status_data <= 0;
             o_rx_mac_valid       <= (|nx_inframe);
+            o_model_rx_frames    <= o_model_rx_frames + frames_this_beat;
 
             rx_seq    <= rx_seq;
             rx_len    <= rx_len;

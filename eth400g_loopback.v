@@ -1,31 +1,44 @@
 //=============================================================================
 // eth400g_loopback.v     -- Verilog-2001
 //
-// 400G loopback datapath for the Agilex 7 F-Tile Ethernet Hard IP.
+//  STAGE 2 : 400G LOOPBACK DATAPATH
 //
-//   RX MAC segmented  ->  pipeline  ->  elastic FIFO  ->  TX MAC segmented
+//  RX MAC segmented  ->  elastic beat FIFO  ->  TX MAC segmented
 //
-// Conforms to F-Tile Ethernet Hard IP User Guide, doc 683023, sec 7.4 / 7.5.
+//  No processing stage. That is STAGE 3 (pipe_proc).
+//
+//  Conforms to F-Tile Ethernet Hard IP User Guide, doc 683023, sec 7.4 / 7.5.
 //
 //=============================================================================
-// DESIGN POINT 1 - NO PACKET LAYER
+// DESIGN POINT 1 - THERE IS NO PACKET LAYER
 //=============================================================================
-// UG sec 7.5: "Packets may start on any 8-byte segment... For multisegmented
-// interfaces, a new packet may start and the previous packet end are within
-// the same cycle."
+// UG sec 7.5:
+//   "Packets may start on any 8-byte segment... For multisegmented
+//    interfaces, a new packet may start and the previous packet end are
+//    within the same cycle."
 //
-// UG sec 7.4 Attention: "To achieve the maximum throughput... the input
-// packets need to be packed tightly, leaving no idle segments in between."
+// UG sec 7.4 (Attention):
+//   "To achieve the maximum throughput when using the TX MAC segmented
+//    interface, the input packets need to be packed tightly, leaving no idle
+//    segments in between."
 //
-// At 400G a beat is 128 bytes and the minimum frame is 64 bytes, so TWO
-// frames land in ONE beat as a matter of course. Any design that keeps a
-// single per-beat packet state - one sop pointer, one in_packet flag, one
-// "count a packet on any_eop" - miscounts and eventually corrupts traffic.
+// A beat is 1024 bits = 128 bytes. The minimum Ethernet frame is 64 bytes.
+// So TWO complete frames arrive in ONE clock cycle as a matter of routine,
+// not as a corner case. Stage 1 demonstrated exactly 2.000 frames per beat.
 //
-// This module has NO packet layer. It buffers and replays 1024-bit beats
-// verbatim, carrying inframe / eop_empty / error / skip_crc as opaque
-// sideband. Multi-frame-per-beat is not "handled" - it is structurally
-// impossible to get wrong, because frame boundaries are never inspected.
+// Any design holding ONE packet state per beat - a single sop pointer, a
+// single in_packet flag, "count a packet on any_eop" - miscounts and
+// eventually commits truncated frames. It passes light testing and corrupts
+// traffic under load.
+//
+// This module therefore has NO packet layer. It buffers and replays 1024-bit
+// beats verbatim, carrying inframe / eop_empty / error / skip_crc through as
+// opaque sideband. Frame boundaries are never inspected, so multi-frame-per-
+// beat is not "handled" - it is structurally impossible to get wrong.
+//
+// Handling it with packet bookkeeping would need 16 parallel packet state
+// machines. For a loopback that buys nothing: what goes out is exactly what
+// came in.
 //
 //=============================================================================
 // DESIGN POINT 2 - TX IS A FIXED-LATENCY PAUSE INTERFACE, NOT READY/VALID
@@ -41,16 +54,25 @@
 //    i_tx_mac_eop_empty, i_tx_mac_error and i_tx_skip_crc signals must be
 //    paused for as many cycles as o_tx_mac_ready is deasserted."
 //
-// Therefore:
-//   * i_tx_mac_valid is o_tx_mac_ready delayed by exactly READY_LATENCY.
+// Consequences:
+//   * o_tx_mac_valid is i_tx_mac_ready DELAYED by READY_LATENCY.
 //     It is NOT derived from whether we have data.
-//   * With nothing to send we still assert valid and drive inframe = 0.
+//   * With nothing to send we STILL assert valid and drive inframe = 0.
 //     An IDLE BEAT IS inframe=0, NOT valid=0.
-//   * When ready is low the ENTIRE datapath freezes - including the
-//     processing pipeline - so nothing is lost.
+//   * While ready is low the entire output bus freezes.
 //
-// A classic ready/valid construct ("out_free = ~valid | ready") is the WRONG
-// protocol here and will fail against the real IP.
+// A classic handshake ("out_free = ~valid | ready") is the WRONG protocol
+// here. It compiles, it passes a naive testbench, and it fails on silicon.
+//
+//=============================================================================
+// DESIGN POINT 3 - REGISTERED FIFO READ (fitting)
+//=============================================================================
+// An asynchronous read  ( wire dout = mem[rd_ptr]; )  makes Quartus infer
+// MLAB / distributed LUTRAM. At 1120 bits x 1024 deep that is ~1792 MLABs,
+// built from ALMs - enormous logic, and it will not close 415 MHz.
+//
+// A REGISTERED read infers M20K: ~56 blocks, trivial on an 027 device.
+// Cost is one cycle of read latency, absorbed by the output stage.
 //=============================================================================
 `timescale 1ps/1ps
 
@@ -58,34 +80,32 @@ module eth400g_loopback #(
     parameter DATA_W        = 1024,
     parameter NUM_SEG       = 16,
     parameter EMPTY_W       = 3,
-    parameter READY_LATENCY = 3,     // must match the IP setting, 1..7
-    parameter PIPE_STAGES   = 4,
-    parameter PROC_BYPASS   = 0,
-    parameter FIFO_DEPTH    = 1024,
-    parameter ADDR_W        = 10
+    parameter READY_LATENCY = 3,     // MUST match the IP configuration, 1..7
+    parameter FIFO_DEPTH    = 512,
+    parameter ADDR_W        = 9
 )(
     input  wire                        i_clk_tx,
     input  wire                        i_clk_rx,
     input  wire                        rst_n,
 
-    // ---- RX MAC segmented client (from IP). No backpressure. ----
+    // ---- RX MAC segmented client (from IP). Takes NO backpressure. ----
     input  wire [DATA_W-1:0]           i_rx_mac_data,
     input  wire                        i_rx_mac_valid,
     input  wire [NUM_SEG-1:0]          i_rx_mac_inframe,
     input  wire [NUM_SEG*EMPTY_W-1:0]  i_rx_mac_eop_empty,
     input  wire [NUM_SEG-1:0]          i_rx_mac_fcs_error,
-    input  wire [NUM_SEG*2-1:0]        i_rx_mac_error,
+    input  wire [NUM_SEG*2-1:0]        i_rx_mac_error,     // 2 bits/segment
 
     // ---- TX MAC segmented client (to IP) ----
     output reg  [DATA_W-1:0]           o_tx_mac_data,
     output reg                         o_tx_mac_valid,
     output reg  [NUM_SEG-1:0]          o_tx_mac_inframe,
     output reg  [NUM_SEG*EMPTY_W-1:0]  o_tx_mac_eop_empty,
-    output reg  [NUM_SEG-1:0]          o_tx_mac_error,
+    output reg  [NUM_SEG-1:0]          o_tx_mac_error,     // 1 bit/segment
     output reg  [NUM_SEG-1:0]          o_tx_mac_skip_crc,
     input  wire                        i_tx_mac_ready,
 
-    // ---- Status ----
+    // ---- Status / observability ----
     output reg  [31:0]                 o_rx_beats,
     output reg  [31:0]                 o_tx_beats,
     output reg  [31:0]                 o_ovf_beats,
@@ -97,34 +117,15 @@ module eth400g_loopback #(
     localparam ENTRY_W = DATA_W + SB_W;
 
     //=====================================================================
-    // TX PAUSE CONTROL - the heart of the protocol
+    // RX ERROR FLATTENING
+    //
+    // UG Table 46: o_rx_mac_error is 2 bits per segment.
+    // UG Table 43: i_tx_mac_error is 1 bit per segment.
+    //
+    // RX error codes:  0 none, 1 malformed, 2 under/oversized,
+    //                  3 payload length error
+    // Any non-zero code, or an FCS error, becomes the single TX error bit.
     //=====================================================================
-    // valid is ready delayed by exactly READY_LATENCY cycles.
-    reg [7:0] rdy_pipe;
-    always @(posedge i_clk_tx or negedge rst_n) begin
-        if (!rst_n) rdy_pipe <= 8'd0;
-        else        rdy_pipe <= {rdy_pipe[6:0], i_tx_mac_ready};
-    end
-
-    // NOTE the index: outputs below are REGISTERED, which adds one cycle.
-    // Tapping at [READY_LATENCY-2] makes the registered o_tx_mac_valid land
-    // at exactly READY_LATENCY cycles after o_tx_mac_ready, as UG 683023
-    // sec 7.4 requires. Tapping at [READY_LATENCY-1] is off by one.
-    wire tx_en = (READY_LATENCY >= 2) ? rdy_pipe[READY_LATENCY-2]
-                                       : i_tx_mac_ready;
-
-    //=====================================================================
-    // Stage 1: pipelined processing (II=1, frozen by tx_en)
-    //=====================================================================
-    wire                       p_valid;
-    wire [DATA_W-1:0]          p_data;
-    wire [NUM_SEG-1:0]         p_inframe;
-    wire [NUM_SEG*EMPTY_W-1:0] p_eop_empty;
-    wire [NUM_SEG-1:0]         p_error;
-    wire [NUM_SEG-1:0]         p_skip_crc;
-
-    // RX error is 2 bits/segment; the TX interface takes 1 bit/segment.
-    // Any non-zero RX error code, or an FCS error, marks the frame bad.
     wire [NUM_SEG-1:0] rx_err_flat;
     genvar gi;
     generate
@@ -134,68 +135,88 @@ module eth400g_loopback #(
       end
     endgenerate
 
-    pipe_proc #(
-        .DATA_W(DATA_W), .NUM_SEG(NUM_SEG), .EMPTY_W(EMPTY_W),
-        .PIPE_STAGES(PIPE_STAGES), .BYPASS(PROC_BYPASS)
-    ) u_proc (
-        .clk(i_clk_rx), .rst_n(rst_n),
-        .i_en(1'b1),                       // RX side runs free
-        .i_valid(i_rx_mac_valid),
-        .i_data(i_rx_mac_data),
-        .i_inframe(i_rx_mac_inframe),
-        .i_eop_empty(i_rx_mac_eop_empty),
-        .i_error(rx_err_flat),
-        .i_skip_crc({NUM_SEG{1'b0}}),      // let the MAC insert CRC
-        .o_valid(p_valid),
-        .o_data(p_data),
-        .o_inframe(p_inframe),
-        .o_eop_empty(p_eop_empty),
-        .o_error(p_error),
-        .o_skip_crc(p_skip_crc)
-    );
-
     //=====================================================================
-    // Stage 2: elastic beat FIFO
+    // ELASTIC BEAT FIFO
+    //
+    // Simple dual-port: write on the RX clock, read on the TX clock.
+    // Explicit ramstyle keeps it in M20K, not MLAB.
     //=====================================================================
+    (* ramstyle = "M20K, no_rw_check" *)
     reg [ENTRY_W-1:0] mem [0:FIFO_DEPTH-1];
-    reg [ADDR_W:0]    wr_ptr, rd_ptr;
+
+    reg [ADDR_W:0] wr_ptr, rd_ptr;
 
     wire [ADDR_W:0] level = wr_ptr - rd_ptr;
     wire            full  = (level >= FIFO_DEPTH);
     wire            empty = (wr_ptr == rd_ptr);
     assign o_fifo_level = level;
 
-    wire [ENTRY_W-1:0] wr_entry =
-        {p_data, p_inframe, p_eop_empty, p_error, p_skip_crc};
+    wire [ENTRY_W-1:0] wr_entry = { i_rx_mac_data,
+                                    i_rx_mac_inframe,
+                                    i_rx_mac_eop_empty,
+                                    rx_err_flat,
+                                    {NUM_SEG{1'b0}} };   // skip_crc = 0
 
+    //---------------------------------------------------------------------
+    // WRITE SIDE
+    //
+    // i_rx_mac_valid qualifies the whole interface cycle.
+    // i_rx_mac_inframe says which segments carry frame data.
+    // These mean DIFFERENT things - both are required. A beat with valid=1
+    // but inframe=0 carries no frame content and must not occupy the FIFO.
+    //---------------------------------------------------------------------
     always @(posedge i_clk_rx or negedge rst_n) begin
         if (!rst_n) begin
             wr_ptr      <= 0;
             o_rx_beats  <= 0;
             o_ovf_beats <= 0;
-        end else if (p_valid && (|p_inframe)) begin
-            // Only real data beats are stored. RX idle beats carry no frame
-            // content and must not consume FIFO space.
+        end else if (i_rx_mac_valid && (|i_rx_mac_inframe)) begin
             o_rx_beats <= o_rx_beats + 1'b1;
             if (!full) begin
                 mem[wr_ptr[ADDR_W-1:0]] <= wr_entry;
                 wr_ptr <= wr_ptr + 1'b1;
             end else begin
-                // RX takes no backpressure (UG sec 7.5). If the FIFO is full
-                // the beat is lost - counted so it can never be silent.
+                // UG sec 7.5: "The interface does not take direct
+                // backpressure." RX cannot be stalled, so a full FIFO means
+                // the beat is lost. Counted here so it can never be silent.
+                //
+                // The production answer is PAUSE/PFC flow control (UG
+                // sec 4.2.3), which stops the far end rather than dropping.
                 o_ovf_beats <= o_ovf_beats + 1'b1;
             end
         end
     end
 
     //=====================================================================
-    // Stage 3: TX output - fixed-latency pause protocol
+    // TX PAUSE CONTROL - the heart of the protocol
     //=====================================================================
-    wire [ENTRY_W-1:0] dout = mem[rd_ptr[ADDR_W-1:0]];
+    reg [7:0] rdy_pipe;
+    always @(posedge i_clk_tx or negedge rst_n) begin
+        if (!rst_n) rdy_pipe <= 8'd0;
+        else        rdy_pipe <= {rdy_pipe[6:0], i_tx_mac_ready};
+    end
+
+    // The outputs below are REGISTERED, which adds one cycle. Tapping at
+    // [READY_LATENCY-2] makes o_tx_mac_valid land exactly READY_LATENCY
+    // cycles after i_tx_mac_ready. Tapping at [READY_LATENCY-1] is off by
+    // one - a real bug caught by the model's protocol checker.
+    wire tx_en = (READY_LATENCY >= 2) ? rdy_pipe[READY_LATENCY-2]
+                                       : i_tx_mac_ready;
+
+    //=====================================================================
+    // TX OUTPUT with registered FIFO read
+    //=====================================================================
+    reg [ENTRY_W-1:0] mem_q;      // registered read data
+    reg               rd_vld_d;   // a read was issued last cycle
+
+    always @(posedge i_clk_tx) begin
+        if (tx_en) mem_q <= mem[rd_ptr[ADDR_W-1:0]];
+    end
 
     always @(posedge i_clk_tx or negedge rst_n) begin
         if (!rst_n) begin
             rd_ptr             <= 0;
+            rd_vld_d           <= 1'b0;
             o_tx_mac_data      <= 0;
             o_tx_mac_valid     <= 1'b0;
             o_tx_mac_inframe   <= 0;
@@ -205,21 +226,28 @@ module eth400g_loopback #(
             o_tx_beats         <= 0;
         end else begin
 
-            // valid ALWAYS tracks ready delayed by READY_LATENCY - it is
-            // never gated on having data. UG sec 7.4: valid asserts whenever
-            // ready is asserted "even though there is no packet to send".
+            // valid ALWAYS tracks ready delayed by READY_LATENCY. Never
+            // gated on having data. UG sec 7.4: valid asserts whenever ready
+            // is asserted "even though there is no packet to send".
             o_tx_mac_valid <= tx_en;
 
             if (tx_en) begin
+                // Issue the next read one cycle ahead
                 if (!empty) begin
+                    rd_ptr   <= rd_ptr + 1'b1;
+                    rd_vld_d <= 1'b1;
+                end else begin
+                    rd_vld_d <= 1'b0;
+                end
+
+                // Drive the beat fetched last cycle
+                if (rd_vld_d) begin
                     {o_tx_mac_data, o_tx_mac_inframe, o_tx_mac_eop_empty,
-                     o_tx_mac_error, o_tx_mac_skip_crc} <= dout;
-                    rd_ptr     <= rd_ptr + 1'b1;
+                     o_tx_mac_error, o_tx_mac_skip_crc} <= mem_q;
                     o_tx_beats <= o_tx_beats + 1'b1;
                 end else begin
-                    // Nothing to send: drive an IDLE BEAT.
-                    // inframe = 0 with valid still asserted. Deasserting
-                    // valid here would violate the protocol.
+                    // IDLE BEAT: inframe = 0 with valid still asserted.
+                    // Deasserting valid here would break the protocol.
                     o_tx_mac_data      <= 0;
                     o_tx_mac_inframe   <= 0;
                     o_tx_mac_eop_empty <= 0;
